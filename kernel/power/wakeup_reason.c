@@ -15,6 +15,7 @@
  * GNU General Public License for more details.
  */
 
+#include <linux/compiler.h>
 #include <linux/wakeup_reason.h>
 #include <linux/kernel.h>
 #include <linux/irq.h>
@@ -28,282 +29,227 @@
 #include <linux/suspend.h>
 #include <linux/slab.h>
 
-/*
- * struct wakeup_irq_node - stores data and relationships for IRQs logged as
- * either base or nested wakeup reasons during suspend/resume flow.
- * @siblings - for membership on leaf or parent IRQ lists
- * @irq      - the IRQ number
- * @irq_name - the name associated with the IRQ, or a default if none
- */
-struct wakeup_irq_node {
-	struct list_head siblings;
-	int irq;
-	const char *irq_name;
-};
+#define MAX_WAKEUP_REASON_IRQS 32
+static bool suspend_abort;
+static char abort_reason[MAX_SUSPEND_ABORT_LEN];
 
-static DEFINE_SPINLOCK(wakeup_reason_lock);
-
-static LIST_HEAD(leaf_irqs);   /* kept in ascending IRQ sorted order */
-static LIST_HEAD(parent_irqs); /* unordered */
+static struct wakeup_irq_node *base_irq_nodes;
+static struct wakeup_irq_node *cur_irq_tree;
+static int cur_irq_tree_depth;
+static LIST_HEAD(wakeup_irqs);
 
 static struct kmem_cache *wakeup_irq_nodes_cache;
-
-static const char *default_irq_name = "(unnamed)";
-
-static struct kobject *kobj;
-
-static bool capture_reasons;
-static bool suspend_abort;
-static bool abnormal_wake;
-static char non_irq_wake_reason[MAX_SUSPEND_ABORT_LEN];
+static struct kobject *wakeup_reason;
+static spinlock_t resume_reason_lock;
+bool log_wakeups __read_mostly;
+struct completion wakeups_completion;
 
 static ktime_t last_monotime; /* monotonic time before last suspend */
 static ktime_t curr_monotime; /* monotonic time after last suspend */
 static ktime_t last_stime; /* monotonic boottime offset before last suspend */
 static ktime_t curr_stime; /* monotonic boottime offset after last suspend */
 
-static void init_node(struct wakeup_irq_node *p, int irq)
+static void init_wakeup_irq_node(struct wakeup_irq_node *p, int irq)
 {
-	struct irq_desc *desc;
-
-	INIT_LIST_HEAD(&p->siblings);
-
 	p->irq = irq;
-	desc = irq_to_desc(irq);
-	if (desc && desc->action && desc->action->name)
-		p->irq_name = desc->action->name;
-	else
-		p->irq_name = default_irq_name;
+	p->desc = irq_to_desc(irq);
+	p->child = NULL;
+	p->parent = NULL;
+	p->handled = false;
+	INIT_LIST_HEAD(&p->siblings);
+	INIT_LIST_HEAD(&p->next);
 }
 
-static struct wakeup_irq_node *create_node(int irq)
-{
-	struct wakeup_irq_node *result;
-
-	result = kmem_cache_alloc(wakeup_irq_nodes_cache, GFP_ATOMIC);
-	if (unlikely(!result))
-		pr_warn("Failed to log wakeup IRQ %d\n", irq);
-	else
-		init_node(result, irq);
-
-	return result;
-}
-
-static void delete_list(struct list_head *head)
+static struct wakeup_irq_node *alloc_irq_node(int irq)
 {
 	struct wakeup_irq_node *n;
 
-	while (!list_empty(head)) {
-		n = list_first_entry(head, struct wakeup_irq_node, siblings);
-		list_del(&n->siblings);
-		kmem_cache_free(wakeup_irq_nodes_cache, n);
+	n = kmem_cache_alloc(wakeup_irq_nodes_cache, GFP_ATOMIC);
+	if (!n) {
+		pr_warning("Failed to log chained wakeup IRQ %d\n",
+			irq);
+		return NULL;
 	}
+
+	init_wakeup_irq_node(n, irq);
+	return n;
 }
 
-static bool add_sibling_node_sorted(struct list_head *head, int irq)
+static struct wakeup_irq_node *
+search_siblings(struct wakeup_irq_node *root, int irq)
 {
+	bool found = false;
 	struct wakeup_irq_node *n = NULL;
-	struct list_head *predecessor = head;
+	WARN_ON(!root);
 
-	if (unlikely(WARN_ON(!head)))
-		return NULL;
+	if (root->irq == irq)
+		return root;
 
-	if (!list_empty(head))
-		list_for_each_entry(n, head, siblings) {
-			if (n->irq < irq)
-				predecessor = &n->siblings;
-			else if (n->irq == irq)
-				return true;
-			else
-				break;
+	list_for_each_entry(n, &root->siblings, siblings) {
+		if (n->irq == irq) {
+			found = true;
+			break;
 		}
-
-	n = create_node(irq);
-	if (n) {
-		list_add(&n->siblings, predecessor);
-		return true;
 	}
 
-	return false;
+	return found ? n : NULL;
 }
 
-static struct wakeup_irq_node *find_node_in_list(struct list_head *head,
-						 int irq)
+static struct wakeup_irq_node *
+add_to_siblings(struct wakeup_irq_node *root, int irq)
 {
 	struct wakeup_irq_node *n;
-
-	if (unlikely(WARN_ON(!head)))
-		return NULL;
-
-	list_for_each_entry(n, head, siblings)
-		if (n->irq == irq)
+	if (root) {
+		n = search_siblings(root, irq);
+		if (n)
 			return n;
+	}
+	n = alloc_irq_node(irq);
 
+	if (n && root)
+		list_add(&n->siblings, &root->siblings);
+	return n;
+}
+
+static struct wakeup_irq_node *add_child(struct wakeup_irq_node *root, int irq)
+{
+	if (!root->child) {
+		root->child = alloc_irq_node(irq);
+		if (!root->child)
+			return NULL;
+		root->child->parent = root;
+		return root->child;
+	}
+
+	return add_to_siblings(root->child, irq);
+}
+
+static struct wakeup_irq_node *find_first_sibling(struct wakeup_irq_node *node)
+{
+	struct wakeup_irq_node *n;
+	if (node->parent)
+		return node;
+	list_for_each_entry(n, &node->siblings, siblings) {
+		if (n->parent)
+			return n;
+	}
 	return NULL;
 }
 
-void log_irq_wakeup_reason(int irq)
+static struct wakeup_irq_node *
+get_base_node(struct wakeup_irq_node *node, unsigned int depth)
 {
-	unsigned long flags;
+	if (!node)
+		return NULL;
 
-	spin_lock_irqsave(&wakeup_reason_lock, flags);
-
-	if (!capture_reasons) {
-		spin_unlock_irqrestore(&wakeup_reason_lock, flags);
-		return;
+	while (depth) {
+		node = find_first_sibling(node);
+		WARN_ON(!node);
+		node = node->parent;
+		depth--;
 	}
 
-	if (find_node_in_list(&parent_irqs, irq) == NULL)
-		add_sibling_node_sorted(&leaf_irqs, irq);
-
-	spin_unlock_irqrestore(&wakeup_reason_lock, flags);
+	return node;
 }
 
-void log_threaded_irq_wakeup_reason(int irq, int parent_irq)
-{
-	struct wakeup_irq_node *parent;
-	unsigned long flags;
-
-	/*
-	 * Intentionally unsynchronized.  Calls that come in after we have
-	 * resumed should have a fast exit path since there's no work to be
-	 * done, any any coherence issue that could cause a wrong value here is
-	 * both highly improbable - given the set/clear timing - and very low
-	 * impact (parent IRQ gets logged instead of the specific child).
-	 */
-	if (!capture_reasons)
-		return;
-
-	spin_lock_irqsave(&wakeup_reason_lock, flags);
-
-	if (!capture_reasons || (find_node_in_list(&leaf_irqs, irq) != NULL)) {
-		spin_unlock_irqrestore(&wakeup_reason_lock, flags);
-		return;
-	}
-
-	parent = find_node_in_list(&parent_irqs, parent_irq);
-	if (parent != NULL)
-		add_sibling_node_sorted(&leaf_irqs, irq);
-	else {
-		parent = find_node_in_list(&leaf_irqs, parent_irq);
-		if (parent != NULL) {
-			list_del_init(&parent->siblings);
-			list_add_tail(&parent->siblings, &parent_irqs);
-			add_sibling_node_sorted(&leaf_irqs, irq);
-		}
-	}
-
-	spin_unlock_irqrestore(&wakeup_reason_lock, flags);
-}
-
-static void __log_abort_or_abnormal_wake(bool abort, const char *fmt,
-					 va_list args)
-{
-	unsigned long flags;
-
-	spin_lock_irqsave(&wakeup_reason_lock, flags);
-
-	/* Suspend abort or abnormal wake reason has already been logged. */
-	if (suspend_abort || abnormal_wake) {
-		spin_unlock_irqrestore(&wakeup_reason_lock, flags);
-		return;
-	}
-
-	suspend_abort = abort;
-	abnormal_wake = !abort;
-	vsnprintf(non_irq_wake_reason, MAX_SUSPEND_ABORT_LEN, fmt, args);
-
-	spin_unlock_irqrestore(&wakeup_reason_lock, flags);
-}
-
-void log_suspend_abort_reason(const char *fmt, ...)
-{
-	va_list args;
-
-	va_start(args, fmt);
-	__log_abort_or_abnormal_wake(true, fmt, args);
-	va_end(args);
-}
-
-void log_abnormal_wakeup_reason(const char *fmt, ...)
-{
-	va_list args;
-
-	va_start(args, fmt);
-	__log_abort_or_abnormal_wake(false, fmt, args);
-	va_end(args);
-}
-
-void clear_wakeup_reasons(void)
-{
-	unsigned long flags;
-
-	spin_lock_irqsave(&wakeup_reason_lock, flags);
-
-	delete_list(&leaf_irqs);
-	delete_list(&parent_irqs);
-	suspend_abort = false;
-	abnormal_wake = false;
-	capture_reasons = true;
-
-	spin_unlock_irqrestore(&wakeup_reason_lock, flags);
-}
+static const struct list_head *get_wakeup_reasons_nosync(void);
 
 static void print_wakeup_sources(void)
 {
 	struct wakeup_irq_node *n;
-	unsigned long flags;
-
-	spin_lock_irqsave(&wakeup_reason_lock, flags);
-
-	capture_reasons = false;
+	const struct list_head *wakeups;
 
 	if (suspend_abort) {
-		pr_info("Abort: %s\n", non_irq_wake_reason);
-		spin_unlock_irqrestore(&wakeup_reason_lock, flags);
+		pr_info("Abort: %s", abort_reason);
 		return;
 	}
 
-	if (!list_empty(&leaf_irqs))
-		list_for_each_entry(n, &leaf_irqs, siblings)
+	wakeups = get_wakeup_reasons_nosync();
+	list_for_each_entry(n, wakeups, next) {
+		if (n->desc && n->desc->action && n->desc->action->name)
 			pr_info("Resume caused by IRQ %d, %s\n", n->irq,
-				n->irq_name);
-	else if (abnormal_wake)
-		pr_info("Resume caused by %s\n", non_irq_wake_reason);
-	else
-		pr_info("Resume cause unknown\n");
+				n->desc->action->name);
+		else
+			pr_info("Resume caused by IRQ %d\n", n->irq);
+	}
+}
 
-	spin_unlock_irqrestore(&wakeup_reason_lock, flags);
+static bool walk_irq_node_tree(struct wakeup_irq_node *root,
+		bool (*visit)(struct wakeup_irq_node *, void *),
+		void *cookie)
+{
+	struct wakeup_irq_node *n, *t;
+
+	if (!root)
+		return true;
+
+	list_for_each_entry_safe(n, t, &root->siblings, siblings) {
+		if (!walk_irq_node_tree(n->child, visit, cookie))
+			return false;
+		if (!visit(n, cookie))
+			return false;
+	}
+
+	if (!walk_irq_node_tree(root->child, visit, cookie))
+		return false;
+	return visit(root, cookie);
+}
+
+static bool is_node_handled(struct wakeup_irq_node *n, void *_p)
+{
+	return n->handled;
+}
+
+static bool base_irq_nodes_done(void)
+{
+	return walk_irq_node_tree(base_irq_nodes, is_node_handled, NULL);
+}
+
+struct buf_cookie {
+	char *buf;
+	int buf_offset;
+};
+
+static bool print_leaf_node(struct wakeup_irq_node *n, void *_p)
+{
+	struct buf_cookie *b = _p;
+	if (!n->child) {
+		if (n->desc && n->desc->action && n->desc->action->name)
+			b->buf_offset +=
+				snprintf(b->buf + b->buf_offset,
+					PAGE_SIZE - b->buf_offset,
+					"%d %s\n",
+					n->irq, n->desc->action->name);
+		else
+			b->buf_offset +=
+				snprintf(b->buf + b->buf_offset,
+					PAGE_SIZE - b->buf_offset,
+					"%d\n",
+					n->irq);
+	}
+	return true;
 }
 
 static ssize_t last_resume_reason_show(struct kobject *kobj,
-				       struct kobj_attribute *attr, char *buf)
+					struct kobj_attribute *attr,
+					char *buf)
 {
-	ssize_t buf_offset = 0;
-	struct wakeup_irq_node *n;
 	unsigned long flags;
 
-	spin_lock_irqsave(&wakeup_reason_lock, flags);
+	struct buf_cookie b = {
+		.buf = buf,
+		.buf_offset = 0
+	};
 
-	if (suspend_abort) {
-		buf_offset = scnprintf(buf, PAGE_SIZE, "Abort: %s",
-				       non_irq_wake_reason);
-		spin_unlock_irqrestore(&wakeup_reason_lock, flags);
-		return buf_offset;
-	}
+	spin_lock_irqsave(&resume_reason_lock, flags);
+	if (suspend_abort)
+		b.buf_offset = snprintf(buf, PAGE_SIZE, "Abort: %s",
+					abort_reason);
+	else
+		walk_irq_node_tree(base_irq_nodes, print_leaf_node, &b);
+	spin_unlock_irqrestore(&resume_reason_lock, flags);
 
-	if (!list_empty(&leaf_irqs))
-		list_for_each_entry(n, &leaf_irqs, siblings)
-			buf_offset += scnprintf(buf + buf_offset,
-						PAGE_SIZE - buf_offset,
-						"%d %s\n", n->irq, n->irq_name);
-	else if (abnormal_wake)
-		buf_offset = scnprintf(buf, PAGE_SIZE, "-1 %s",
-				       non_irq_wake_reason);
-
-	spin_unlock_irqrestore(&wakeup_reason_lock, flags);
-
-	return buf_offset;
+	return b.buf_offset;
 }
 
 static ssize_t last_suspend_time_show(struct kobject *kobj,
@@ -349,22 +295,266 @@ static struct attribute_group attr_group = {
 	.attrs = attrs,
 };
 
+static inline void stop_logging_wakeup_reasons(void)
+{
+	WRITE_ONCE(log_wakeups, false);
+}
+
+/*
+ * stores the immediate wakeup irqs; these often aren't the ones seen by
+ * the drivers that registered them, due to chained interrupt controllers,
+ * and multiple-interrupt dispatch.
+ */
+void log_base_wakeup_reason(int irq)
+{
+	/* No locking is needed, since this function is called within
+	 * syscore_resume, with both nonboot CPUs and interrupts disabled.
+	 */
+	base_irq_nodes = add_to_siblings(base_irq_nodes, irq);
+	WARN_ON(!base_irq_nodes);
+}
+
+/* This function is called by generic_handle_irq, which may call itself
+ * recursively.  This happens with interrupts disabled.  Using
+ * log_possible_wakeup_reason, we build a tree of interrupts, tracing the call
+ * stack of generic_handle_irq, for each wakeup source containing the
+ * interrupts actually handled.
+ *
+ * Most of these "trees" would either have a single node (in the event that the
+ * wakeup source is the final interrupt), or consist of a list of two
+ * interrupts, with the wakeup source at the root, and the final dispatched
+ * interrupt at the leaf.
+ *
+ * When *all* wakeup sources have been thusly spoken for, this function will
+ * clear the log_wakeups flag, and print the wakeup reasons.
+
+   TODO: percpu
+
+ */
+
+struct wakeup_irq_node *
+log_possible_wakeup_reason_start(int irq, struct irq_desc *desc,
+				 unsigned int depth)
+{
+	WARN_ON(!irqs_disabled() || !logging_wakeup_reasons());
+	WARN_ON((signed int)depth < 0);
+
+	/* If suspend was aborted, the base IRQ nodes are missing, and we stop
+	 * logging interrupts immediately.
+	 */
+	if (!base_irq_nodes) {
+		stop_logging_wakeup_reasons();
+		return NULL;
+	}
+
+	/* We assume wakeup interrupts are handlerd only by the first core. */
+	/* TODO: relax this by having percpu versions of the irq tree */
+	if (smp_processor_id() != 0) {
+		return NULL;
+	}
+
+	if (depth == 0) {
+		cur_irq_tree_depth = 0;
+		cur_irq_tree = search_siblings(base_irq_nodes, irq);
+	} else if (cur_irq_tree) {
+		if (depth > cur_irq_tree_depth) {
+			WARN_ON(depth - cur_irq_tree_depth > 1);
+			cur_irq_tree = add_child(cur_irq_tree, irq);
+			if (cur_irq_tree)
+				cur_irq_tree_depth++;
+		} else {
+			cur_irq_tree = get_base_node(cur_irq_tree,
+					cur_irq_tree_depth - depth);
+			cur_irq_tree_depth = depth;
+			cur_irq_tree = add_to_siblings(cur_irq_tree, irq);
+		}
+	}
+
+	return cur_irq_tree;
+}
+
+void log_possible_wakeup_reason_complete(struct wakeup_irq_node *n,
+					unsigned int depth,
+					bool handled)
+{
+	if (!n)
+		return;
+	n->handled = handled;
+	if (depth == 0) {
+		if (base_irq_nodes_done()) {
+			stop_logging_wakeup_reasons();
+			complete(&wakeups_completion);
+			print_wakeup_sources();
+		}
+	}
+}
+
+bool log_possible_wakeup_reason(int irq,
+			struct irq_desc *desc,
+			bool (*handler)(struct irq_desc *))
+{
+	static DEFINE_PER_CPU(unsigned int, depth);
+
+	struct wakeup_irq_node *n;
+	bool handled;
+	unsigned int d;
+
+	d = get_cpu_var(depth)++;
+	put_cpu_var(depth);
+
+	n = log_possible_wakeup_reason_start(irq, desc, d);
+
+	handled = handler(desc);
+
+	d = --get_cpu_var(depth);
+	put_cpu_var(depth);
+
+	if (!handled && desc && desc->action)
+		pr_debug("%s: irq %d action %pF not handled\n", __func__,
+			irq, desc->action->handler);
+
+	log_possible_wakeup_reason_complete(n, d, handled);
+
+	return handled;
+}
+
+void log_suspend_abort_reason(const char *fmt, ...)
+{
+	va_list args;
+
+	spin_lock(&resume_reason_lock);
+
+	//Suspend abort reason has already been logged.
+	if (suspend_abort) {
+		spin_unlock(&resume_reason_lock);
+		return;
+	}
+
+	suspend_abort = true;
+	va_start(args, fmt);
+	vsnprintf(abort_reason, MAX_SUSPEND_ABORT_LEN, fmt, args);
+	va_end(args);
+
+	spin_unlock(&resume_reason_lock);
+}
+
+static bool match_node(struct wakeup_irq_node *n, void *_p)
+{
+	int irq = *((int *)_p);
+	return n->irq != irq;
+}
+
+int check_wakeup_reason(int irq)
+{
+	bool found;
+	spin_lock(&resume_reason_lock);
+	found = !walk_irq_node_tree(base_irq_nodes, match_node, &irq);
+	spin_unlock(&resume_reason_lock);
+	return found;
+}
+
+static bool build_leaf_nodes(struct wakeup_irq_node *n, void *_p)
+{
+	struct list_head *wakeups = _p;
+	if (!n->child)
+		list_add(&n->next, wakeups);
+	return true;
+}
+
+static const struct list_head *get_wakeup_reasons_nosync(void)
+{
+	WARN_ON(logging_wakeup_reasons());
+	INIT_LIST_HEAD(&wakeup_irqs);
+	walk_irq_node_tree(base_irq_nodes, build_leaf_nodes, &wakeup_irqs);
+	return &wakeup_irqs;
+}
+
+static bool build_unfinished_nodes(struct wakeup_irq_node *n, void *_p)
+{
+	struct list_head *unfinished = _p;
+	if (!n->handled) {
+		pr_warning("%s: wakeup irq %d was not handled\n",
+			   __func__, n->irq);
+		list_add(&n->next, unfinished);
+	}
+	return true;
+}
+
+const struct list_head *get_wakeup_reasons(unsigned long timeout,
+					   struct list_head *unfinished)
+{
+	INIT_LIST_HEAD(unfinished);
+
+	if (logging_wakeup_reasons()) {
+		unsigned long signalled = 0;
+		if (timeout)
+			signalled = wait_for_completion_timeout(
+				&wakeups_completion, timeout);
+		if (WARN_ON(!signalled)) {
+			stop_logging_wakeup_reasons();
+			walk_irq_node_tree(
+				base_irq_nodes, build_unfinished_nodes,
+				unfinished);
+			return NULL;
+		}
+		pr_info("%s: waited for %u ms\n",
+				__func__,
+				jiffies_to_msecs(timeout - signalled));
+	}
+
+	return get_wakeup_reasons_nosync();
+}
+
+static bool delete_node(struct wakeup_irq_node *n, void *unused)
+{
+	list_del(&n->siblings);
+	kmem_cache_free(wakeup_irq_nodes_cache, n);
+	return true;
+}
+
+void clear_wakeup_reasons(void)
+{
+	unsigned long flags;
+	spin_lock_irqsave(&resume_reason_lock, flags);
+
+	WARN_ON(logging_wakeup_reasons());
+	walk_irq_node_tree(base_irq_nodes, delete_node, NULL);
+	base_irq_nodes = NULL;
+	cur_irq_tree = NULL;
+	cur_irq_tree_depth = 0;
+	INIT_LIST_HEAD(&wakeup_irqs);
+	suspend_abort = false;
+
+	spin_unlock_irqrestore(&resume_reason_lock, flags);
+}
+
 /* Detects a suspend and clears all the previous wake up reasons*/
 static int wakeup_reason_pm_event(struct notifier_block *notifier,
 		unsigned long pm_event, void *unused)
 {
 	switch (pm_event) {
 	case PM_SUSPEND_PREPARE:
+		spin_lock(&resume_reason_lock);
+		suspend_abort = false;
+		spin_unlock(&resume_reason_lock);
 		/* monotonic time since boot */
 		last_monotime = ktime_get();
-		/* monotonic time since boot including the time spent in suspend */
+		/* monotonic time since boot including the time spent in
+		 * suspend */
 		last_stime = ktime_get_boottime();
 		clear_wakeup_reasons();
 		break;
 	case PM_POST_SUSPEND:
+		/* log_wakeups should have been cleared by now. */
+		if (WARN_ON(logging_wakeup_reasons())) {
+			stop_logging_wakeup_reasons();
+			mb();
+			print_wakeup_sources();
+		}
 		/* monotonic time since boot */
 		curr_monotime = ktime_get();
-		/* monotonic time since boot including the time spent in suspend */
+		/* monotonic time since boot including the time spent in
+		 * suspend */
 		curr_stime = ktime_get_boottime();
 		print_wakeup_sources();
 		break;
@@ -378,36 +568,42 @@ static struct notifier_block wakeup_reason_pm_notifier_block = {
 	.notifier_call = wakeup_reason_pm_event,
 };
 
-static int __init wakeup_reason_init(void)
+int __init wakeup_reason_init(void)
 {
+	spin_lock_init(&resume_reason_lock);
+
 	if (register_pm_notifier(&wakeup_reason_pm_notifier_block)) {
-		pr_warn("[%s] failed to register PM notifier\n", __func__);
+		pr_warning("[%s] failed to register PM notifier\n",
+			__func__);
 		goto fail;
 	}
 
-	kobj = kobject_create_and_add("wakeup_reasons", kernel_kobj);
-	if (!kobj) {
-		pr_warn("[%s] failed to create a sysfs kobject\n", __func__);
+	wakeup_reason = kobject_create_and_add("wakeup_reasons", kernel_kobj);
+	if (!wakeup_reason) {
+		pr_warning("[%s] failed to create a sysfs kobject\n",
+				__func__);
 		goto fail_unregister_pm_notifier;
 	}
 
-	if (sysfs_create_group(kobj, &attr_group)) {
-		pr_warn("[%s] failed to create a sysfs group\n", __func__);
+	if (sysfs_create_group(wakeup_reason, &attr_group)) {
+		pr_warning("[%s] failed to create a sysfs group\n",
+			__func__);
 		goto fail_kobject_put;
 	}
 
 	wakeup_irq_nodes_cache =
 		kmem_cache_create("wakeup_irq_node_cache",
-				  sizeof(struct wakeup_irq_node), 0, 0, NULL);
+					sizeof(struct wakeup_irq_node), 0,
+					0, NULL);
 	if (!wakeup_irq_nodes_cache)
 		goto fail_remove_group;
 
 	return 0;
 
 fail_remove_group:
-	sysfs_remove_group(kobj, &attr_group);
+	sysfs_remove_group(wakeup_reason, &attr_group);
 fail_kobject_put:
-	kobject_put(kobj);
+	kobject_put(wakeup_reason);
 fail_unregister_pm_notifier:
 	unregister_pm_notifier(&wakeup_reason_pm_notifier_block);
 fail:
