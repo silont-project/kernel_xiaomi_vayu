@@ -905,7 +905,7 @@ int pkey_findcard(const struct pkey_seckey *seckey,
 		return -EINVAL;
 
 	/* fetch status of all crypto cards */
-	device_matrix = kmalloc(sizeof(struct zcrypt_device_matrix),
+ 	device_matrix = kmalloc_array(sizeof(struct zcrypt_device_matrix),
 				GFP_KERNEL);
 	if (!device_matrix)
 		return -ENOMEM;

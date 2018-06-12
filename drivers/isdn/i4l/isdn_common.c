@@ -2083,7 +2083,8 @@ isdn_add_channels(isdn_driver_t *d, int drvidx, int n, int adding)
 			skb_queue_purge(&d->rpqueue[j]);
 		kfree(d->rpqueue);
 	}
-	if (!(d->rpqueue = kmalloc(sizeof(struct sk_buff_head) * m, GFP_ATOMIC))) {
+	d->rpqueue = kmalloc_array(m, sizeof(struct sk_buff_head), GFP_ATOMIC);
+	if (!d->rpqueue) {
 		printk(KERN_WARNING "register_isdn: Could not alloc rpqueue\n");
 		if (!adding) {
 			kfree(d->rcvcount);
@@ -2097,7 +2098,8 @@ isdn_add_channels(isdn_driver_t *d, int drvidx, int n, int adding)
 
 	if ((adding) && (d->rcv_waitq))
 		kfree(d->rcv_waitq);
-	d->rcv_waitq = kmalloc(sizeof(wait_queue_head_t) * 2 * m, GFP_ATOMIC);
+	d->rcv_waitq = kmalloc(array3_size(sizeof(wait_queue_head_t), 2, m),
+			       GFP_ATOMIC);
 	if (!d->rcv_waitq) {
 		printk(KERN_WARNING "register_isdn: Could not alloc rcv_waitq\n");
 		if (!adding) {
