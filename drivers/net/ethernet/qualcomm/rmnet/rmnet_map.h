@@ -180,18 +180,14 @@ struct rmnet_map_dl_ind_trl {
 
 struct rmnet_map_dl_ind {
 	u8 priority;
-	union {
-		void (*dl_hdr_handler)(struct rmnet_map_dl_ind_hdr *);
-		void (*dl_hdr_handler_v2)(struct rmnet_map_dl_ind_hdr *,
+	void (*dl_hdr_handler)(struct rmnet_map_dl_ind_hdr *);
+	void (*dl_hdr_handler_v2)(struct rmnet_map_dl_ind_hdr *,
 					  struct
 					  rmnet_map_control_command_header *);
-	} __aligned(1);
-	union {
-		void (*dl_trl_handler)(struct rmnet_map_dl_ind_trl *);
-		void (*dl_trl_handler_v2)(struct rmnet_map_dl_ind_trl *,
+	void (*dl_trl_handler)(struct rmnet_map_dl_ind_trl *);
+	void (*dl_trl_handler_v2)(struct rmnet_map_dl_ind_trl *,
 					  struct
 					  rmnet_map_control_command_header *);
-	} __aligned(1);
 	struct list_head list;
 };
 
