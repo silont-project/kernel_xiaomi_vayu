@@ -2421,6 +2421,7 @@
 		compatible = "qcom,msm-fastrpc-compute";
 		qcom,fastrpc-adsp-audio-pdr;
 		qcom,rpc-latency-us = <235>;
+		qcom,qos-cores = <0 1 2 3 4 5>;
 
 		qcom,msm_fastrpc_compute_cb1 {
 			compatible = "qcom,msm-fastrpc-compute-cb";
@@ -2838,6 +2839,7 @@
 
 				msm_cdsp_rm: qcom,msm_cdsp_rm {
 					compatible = "qcom,msm-cdsp-rm";
+					qcom,qos-cores = <0 1 2 3 4 5>;
 					qcom,qos-latency-us = <44>;
 					qcom,qos-maxhold-ms = <20>;
 					qcom,compute-cx-limit-en;
