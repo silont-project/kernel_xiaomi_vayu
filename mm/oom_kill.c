@@ -542,7 +542,7 @@ static bool oom_reap_task_mm(struct task_struct *tsk, struct mm_struct *mm)
 
 	__oom_reap_task_mm(mm);
 
-	pr_info("oom_reaper: reaped process %d (%s), now anon-rss:%lukB, file-rss:%lukB, shmem-rss:%lukB\n",
+	pr_debug("oom_reaper: reaped process %d (%s), now anon-rss:%lukB, file-rss:%lukB, shmem-rss:%lukB\n",
 			task_pid_nr(tsk), tsk->comm,
 			K(get_mm_counter(mm, MM_ANONPAGES)),
 			K(get_mm_counter(mm, MM_FILEPAGES)),
@@ -693,7 +693,7 @@ void oom_killer_enable(void)
 {
 	oom_killer_disabled = false;
 #ifdef CONFIG_DEBUG_KERNEL
-	pr_info("OOM killer enabled.\n");
+	pr_debug("OOM killer enabled.\n");
 #endif
 }
 
@@ -732,7 +732,7 @@ bool oom_killer_disable(signed long timeout)
 		return false;
 	}
 #ifdef CONFIG_DEBUG_KERNEL
-	pr_info("OOM killer disabled.\n");
+	pr_debug"OOM killer disabled.\n");
 #endif
 	return true;
 }
