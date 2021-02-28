@@ -162,7 +162,8 @@ struct nvt_ts_data {
 	bool dev_pm_suspend;
 	struct completion dev_pm_suspend_completion;
 	bool palm_sensor_switch;
-	struct pm_qos_request pm_qos_req;
+	struct pm_qos_request pm_touch_req;
+	struct pm_qos_request pm_spi_req;
 };
 
 #if NVT_TOUCH_PROC
