@@ -26,6 +26,7 @@
 #include <linux/platform_device.h>
 #include <linux/sysfs.h>
 #include <linux/workqueue.h>
+#include <linux/pm_qos.h>
 
 #include "nt36xxx_mem_map.h"
 
@@ -161,6 +162,7 @@ struct nvt_ts_data {
 	bool dev_pm_suspend;
 	struct completion dev_pm_suspend_completion;
 	bool palm_sensor_switch;
+	struct pm_qos_request pm_qos_req;
 };
 
 #if NVT_TOUCH_PROC
