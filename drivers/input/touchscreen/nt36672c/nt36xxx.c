@@ -1208,6 +1208,7 @@ static irqreturn_t nvt_ts_work_func(int irq, void *data)
 		press_id[TOUCH_MAX_FINGER_NUM] = {0}, input_id = 0;
 	uint32_t position, input_x, input_y, finger_cnt = 0;
 	int ret, i;
+	struct nvt_ts_data *ts_data = (struct nvt_ts_data *)data;
 
 #if WAKEUP_GESTURE
 	if (ts->ic_state < NVT_IC_RESUME_IN) {
@@ -1215,6 +1216,7 @@ static irqreturn_t nvt_ts_work_func(int irq, void *data)
 	}
 #endif
 
+	pm_qos_update_request(&ts_data->pm_qos_req, 100);
 	mutex_lock(&ts->lock);
 	if (ts->dev_pm_suspend) {
 		ret = wait_for_completion_timeout(&ts->dev_pm_suspend_completion, msecs_to_jiffies(500));
@@ -1301,6 +1303,7 @@ static irqreturn_t nvt_ts_work_func(int irq, void *data)
 
 out:
 	mutex_unlock(&ts->lock);
+	pm_qos_update_request(&ts_data->pm_qos_req, PM_QOS_DEFAULT_VALUE);
 	return IRQ_HANDLED;
 }
 
@@ -2041,6 +2044,10 @@ static int32_t nvt_ts_probe(struct platform_device *pdev)
 	if (ts->client->irq) {
 		NVT_LOG("int_trigger_type=%d\n", ts->int_trigger_type);
 		ts->irq_enabled = true;
+		ts->pm_qos_req.type = PM_QOS_REQ_AFFINE_IRQ;
+		ts->pm_qos_req.irq = ts->client->irq;
+		pm_qos_add_request(&ts->pm_qos_req, PM_QOS_CPU_DMA_LATENCY,
+			   PM_QOS_DEFAULT_VALUE);
 		ret = request_threaded_irq(ts->client->irq, NULL, nvt_ts_work_func,
 				ts->int_trigger_type | IRQF_ONESHOT, NVT_SPI_NAME, ts);
 		if (ret != 0) {
@@ -2168,6 +2175,7 @@ err_create_nvt_fwu_wq_failed:
 	device_init_wakeup(&ts->input_dev->dev, 0);
 #endif
 	free_irq(ts->client->irq, ts);
+	pm_qos_remove_request(&ts->pm_qos_req);
 err_int_request_failed:
 	input_unregister_device(ts->input_dev);
 	ts->input_dev = NULL;
@@ -2240,6 +2248,7 @@ static int32_t nvt_ts_remove(struct platform_device *pdev)
 
 	nvt_irq_enable(false);
 	free_irq(ts->client->irq, ts);
+	pm_qos_remove_request(&ts->pm_qos_req);
 
 	mutex_destroy(&ts->xbuf_lock);
 	mutex_destroy(&ts->lock);
