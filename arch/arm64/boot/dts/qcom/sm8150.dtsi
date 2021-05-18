@@ -550,7 +550,7 @@
 	};
 
 	chosen {
-		bootargs = "quite rcu_nocbs=0-7 cgroup.memory=nokmem,nosocket noirqdebug";
+		bootargs = "quite rcu_nocbs=0-7 cgroup.memory=nokmem,nosocket noirqdebug kpti=off";
 	};
 
 	soc: soc { };
