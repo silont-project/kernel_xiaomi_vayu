@@ -103,6 +103,12 @@
 #define ALIGN __ALIGN
 #define ALIGN_STR __ALIGN_STR
 
+#ifndef GLOBAL
+#define GLOBAL(name) \
+	.globl name ASM_NL \
+	name:
+#endif
+
 #ifndef ENTRY
 /* deprecated, use SYM_FUNC_START */
 #define ENTRY(name) \
