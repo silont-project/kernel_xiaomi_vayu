@@ -1174,6 +1174,13 @@ config CPUSET_TOP_APP
 
 endif
 
+config CPUINFO_CACHED_FREQ_TASKS
+	string "Default task names for cached-frequency info enforcement"
+	help
+	  This feature allow us to specify the default values of which libraries
+	  or tasks that are being enforced to showed a cached-frequency instead
+	  of the actual policy.
+
 config DEFAULT_USE_ENERGY_AWARE
 	bool "Default to enabling the Energy Aware Scheduler feature"
 	default n
