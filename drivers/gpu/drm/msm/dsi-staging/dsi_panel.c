@@ -1809,7 +1809,6 @@ const char *cmd_set_prop_map[DSI_CMD_SET_MAX] = {
 	"qcom,mdss-dsi-dispparam-cabcstillon-command",
 	"qcom,mdss-dsi-dispparam-cabcmovieon-command",
 	"qcom,mdss-dsi-dispparam-cabcoff-command",
-	"mi,mdss-dsi-read-lockdown-info-command",
 };
 
 const char *cmd_set_state_map[DSI_CMD_SET_MAX] = {
@@ -1843,7 +1842,6 @@ const char *cmd_set_state_map[DSI_CMD_SET_MAX] = {
 	"qcom,mdss-dsi-dispparam-cabcstillon-command-state",
 	"qcom,mdss-dsi-dispparam-cabcmovieon-command-state",
 	"qcom,mdss-dsi-dispparam-cabcoff-command-state",
-	"mi,mdss-dsi-read-lockdown-info-command-state",
 };
 
 static int dsi_panel_get_cmd_pkt_count(const char *data, u32 length, u32 *cnt)
