@@ -11,4 +11,6 @@ source "drivers/platform/chrome/Kconfig"
 
 source "drivers/platform/msm/Kconfig"
 
+source "drivers/platform/msm/mhi_ssr/Kconfig"
+
 source "drivers/platform/xiaomi/Kconfig"

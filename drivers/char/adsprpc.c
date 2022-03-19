@@ -3744,7 +3744,7 @@ static int fastrpc_setmode(unsigned long ioctl_param,
 		fl->tgid |= (1 << SESSION_ID_INDEX);
 		break;
 	default:
-		err = -ENOTTY;
+		err = -EBADRQC;
 		break;
 	}
 	return err;
@@ -4137,6 +4137,8 @@ static const struct of_device_id fastrpc_match_table[] = {
 	{ .compatible = "qcom,msm-fastrpc-adsp", },
 	{ .compatible = "qcom,msm-fastrpc-compute", },
 	{ .compatible = "qcom,msm-fastrpc-compute-cb", },
+	{ .compatible = "qcom,msm-fastrpc-legacy-compute", },
+	{ .compatible = "qcom,msm-fastrpc-legacy-compute-cb", },
 	{ .compatible = "qcom,msm-adsprpc-mem-region", },
 	{}
 };
@@ -4288,7 +4290,7 @@ static int fastrpc_cb_probe(struct device *dev)
 	}
 
 	chan->sesscount++;
-	if (debugfs_root) {
+	if (debugfs_root && !debugfs_global_file) {
 		debugfs_global_file = debugfs_create_file("global", 0644,
 			debugfs_root, NULL, &debugfs_fops);
 		if (IS_ERR_OR_NULL(debugfs_global_file)) {
